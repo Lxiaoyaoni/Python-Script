@@ -1,0 +1,50 @@
+目标链路:
+
+   手机 App -> AOA USB -> RK3568 bridge -> Windows -> 浏览器
+
+RK3568 端:
+
+1. 启动 AOA 协议
+
+   ./aoa_start_auto
+
+2. 编译 RK3568 bridge
+
+   gcc rk_aoa_bridge.c -o rk_aoa_bridge -lusb-1.0 -lpthread
+
+3. 启动 RK3568 bridge
+
+   ./rk_aoa_bridge WINDOWS_IP 9001 9002
+
+   示例:
+
+   ./rk_aoa_bridge 192.168.110.xxx 9001 9002
+
+   bridge 需要做两件事:
+
+   - 从 AOA USB bulk IN 读取 AVC1/H.264 包
+   - 连接 Windows_IP:9001 并发送完整 AVC1 包
+   - 监听 9002，接收 Windows 发来的 JSON 控制命令，再转成 AOA HID
+
+Windows 端:
+
+1. 先查询 Windows IP
+
+   ipconfig
+
+2. 启动本地视频接收和网页服务
+
+   .\start_windows.ps1 -RkHost 192.168.110.86
+
+3. 浏览器地址
+
+   http://127.0.0.1:18091/
+
+Windows 端口:
+
+   18091 本地浏览器 HTTP/WebSocket 页面
+   9001  接收 RK3568 发来的视频 AVC1/H.264 TCP 流
+
+RK3568 端口:
+
+   9002  接收 Windows 发回的 JSON 控制命令
