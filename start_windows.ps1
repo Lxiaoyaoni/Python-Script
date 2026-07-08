@@ -1,5 +1,6 @@
 param(
     [string]$RkHost = "192.168.110.86",
+    [int]$Instance = -1,
     [int]$HttpPort = 18091,
     [int]$VideoPort = 9001,
     [int]$ControlPort = 9002,
@@ -7,6 +8,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($Instance -ge 0) {
+    $HttpPort = 18091 + ($Instance * 10)
+    $VideoPort = 9001 + ($Instance * 10)
+    $ControlPort = 9002 + ($Instance * 10)
+}
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $server = Join-Path $root "win_video_server.py"
@@ -24,6 +31,9 @@ if (-not $python) {
 }
 
 Write-Host "Windows video receiver"
+if ($Instance -ge 0) {
+    Write-Host "Instance:       $Instance"
+}
 Write-Host "Browser UI:     http://127.0.0.1:$HttpPort/"
 Write-Host "Video input:    Windows TCP port $VideoPort"
 Write-Host "Control output: RK3568 $RkHost`:$ControlPort"

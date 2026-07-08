@@ -74,6 +74,9 @@ static uint64_t last_app_control_error_ms = 0;
 static const char *windows_ip = NULL;
 static int video_port = DEFAULT_VIDEO_PORT;
 static int control_port = DEFAULT_CONTROL_PORT;
+static int selected_device_index = -1;
+static int selected_usb_bus = -1;
+static int selected_usb_address = -1;
 
 struct usb_stream_reader {
     libusb_device_handle *handle;
@@ -189,28 +192,151 @@ static int connect_windows_video(void) {
     return fd;
 }
 
+static const char *find_usb_name(struct usb_id *devices, size_t count, uint16_t vid, uint16_t pid) {
+    for (size_t i = 0; i < count; i++) {
+        if (devices[i].vid == vid && devices[i].pid == pid) {
+            return devices[i].name;
+        }
+    }
+
+    return NULL;
+}
+
+static int match_selected_usb(libusb_device *dev, int match_index) {
+    if (selected_usb_bus >= 0 || selected_usb_address >= 0) {
+        int bus = libusb_get_bus_number(dev);
+        int address = libusb_get_device_address(dev);
+        return bus == selected_usb_bus && address == selected_usb_address;
+    }
+
+    if (selected_device_index >= 0) {
+        return match_index == selected_device_index;
+    }
+
+    return 1;
+}
+
+static void print_matching_devices(
+    libusb_context *ctx,
+    struct usb_id *devices,
+    size_t count,
+    const char *label
+) {
+    libusb_device **list = NULL;
+    ssize_t n = libusb_get_device_list(ctx, &list);
+    int match_index = 0;
+
+    if (n < 0) {
+        printf("list %s devices failed: %s (%ld)\n", label, libusb_error_name((int)n), (long)n);
+        return;
+    }
+
+    printf("%s devices:\n", label);
+
+    for (ssize_t i = 0; i < n; i++) {
+        struct libusb_device_descriptor desc;
+        if (libusb_get_device_descriptor(list[i], &desc) != 0) continue;
+
+        const char *name = find_usb_name(devices, count, desc.idVendor, desc.idProduct);
+        if (!name) continue;
+
+        printf(
+            "  index=%d usb=%03u:%03u id=%04x:%04x %s\n",
+            match_index,
+            libusb_get_bus_number(list[i]),
+            libusb_get_device_address(list[i]),
+            desc.idVendor,
+            desc.idProduct,
+            name
+        );
+        match_index++;
+    }
+
+    if (match_index == 0) {
+        printf("  none\n");
+    }
+
+    libusb_free_device_list(list, 1);
+}
+
+static libusb_device_handle *open_from_list_filtered(
+    libusb_context *ctx,
+    struct usb_id *devices,
+    size_t count,
+    int use_selection,
+    int verbose
+) {
+    libusb_device **list = NULL;
+    ssize_t n = libusb_get_device_list(ctx, &list);
+    int match_index = 0;
+
+    if (n < 0) {
+        printf("get device list failed: %s (%ld)\n", libusb_error_name((int)n), (long)n);
+        return NULL;
+    }
+
+    for (ssize_t i = 0; i < n; i++) {
+        struct libusb_device_descriptor desc;
+        if (libusb_get_device_descriptor(list[i], &desc) != 0) continue;
+
+        const char *name = find_usb_name(devices, count, desc.idVendor, desc.idProduct);
+        if (!name) continue;
+
+        int bus = libusb_get_bus_number(list[i]);
+        int address = libusb_get_device_address(list[i]);
+
+        if (verbose) {
+            printf(
+                "trying device index=%d usb=%03d:%03d id=%04x:%04x (%s)\n",
+                match_index,
+                bus,
+                address,
+                desc.idVendor,
+                desc.idProduct,
+                name
+            );
+        }
+
+        if (use_selection && !match_selected_usb(list[i], match_index)) {
+            match_index++;
+            continue;
+        }
+
+        libusb_device_handle *handle = NULL;
+        int r = libusb_open(list[i], &handle);
+
+        if (r == 0 && handle) {
+            printf(
+                "found device index=%d usb=%03d:%03d id=%04x:%04x (%s)\n",
+                match_index,
+                bus,
+                address,
+                desc.idVendor,
+                desc.idProduct,
+                name
+            );
+            libusb_free_device_list(list, 1);
+            return handle;
+        }
+
+        if (verbose) {
+            printf("open failed: %s (%d)\n", libusb_error_name(r), r);
+        }
+
+        match_index++;
+    }
+
+    libusb_free_device_list(list, 1);
+    return NULL;
+}
+
 static libusb_device_handle *open_from_list(
     libusb_context *ctx,
     struct usb_id *devices,
     size_t count,
     int verbose
 ) {
-    for (size_t i = 0; i < count; i++) {
-        struct usb_id id = devices[i];
-        if (verbose) {
-            printf("trying device: %04x:%04x (%s)\n", id.vid, id.pid, id.name);
-        }
-
-        libusb_device_handle *handle =
-            libusb_open_device_with_vid_pid(ctx, id.vid, id.pid);
-
-        if (handle) {
-            printf("found device: %04x:%04x (%s)\n", id.vid, id.pid, id.name);
-            return handle;
-        }
-    }
-
-    return NULL;
+    return open_from_list_filtered(ctx, devices, count, 0, verbose);
 }
 
 static int send_aoa_string(libusb_device_handle *handle, int index, const char *str) {
@@ -260,6 +386,109 @@ static int wait_for_aoa(libusb_context *ctx, int wait_ms) {
     return 0;
 }
 
+static int start_aoa_on_handle(libusb_device_handle *handle) {
+    unsigned char protocol[2] = {0};
+    int r = libusb_control_transfer(
+        handle,
+        LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE,
+        AOA_GET_PROTOCOL,
+        0,
+        0,
+        protocol,
+        sizeof(protocol),
+        1000
+    );
+
+    if (r != 2) {
+        printf("AOA_GET_PROTOCOL failed: %s (%d)\n", libusb_error_name(r), r);
+        return -1;
+    }
+
+    int version = protocol[0] | (protocol[1] << 8);
+    printf("AOA protocol version: %d\n", version);
+
+    if (send_aoa_string(handle, AOA_STRING_MANUFACTURER, "RK3568") < 0 ||
+        send_aoa_string(handle, AOA_STRING_MODEL, "RK-AOA-DEMO") < 0 ||
+        send_aoa_string(handle, AOA_STRING_DESCRIPTION, "RK3568 AOA Demo") < 0 ||
+        send_aoa_string(handle, AOA_STRING_VERSION, "1.0") < 0 ||
+        send_aoa_string(handle, AOA_STRING_URI, "https://example.com") < 0 ||
+        send_aoa_string(handle, AOA_STRING_SERIAL, "rk3568-001") < 0) {
+        return -1;
+    }
+
+    printf("starting accessory mode...\n");
+
+    r = libusb_control_transfer(
+        handle,
+        LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE,
+        AOA_START_ACCESSORY,
+        0,
+        0,
+        NULL,
+        0,
+        1000
+    );
+
+    if (r < 0) {
+        printf("AOA_START_ACCESSORY failed: %s (%d)\n", libusb_error_name(r), r);
+        return -1;
+    }
+
+    printf("AOA_START_ACCESSORY sent\n");
+    return 0;
+}
+
+static int start_all_starter_devices(libusb_context *ctx) {
+    libusb_device **list = NULL;
+    ssize_t n = libusb_get_device_list(ctx, &list);
+    int started = 0;
+
+    if (n < 0) {
+        printf("get device list failed: %s (%ld)\n", libusb_error_name((int)n), (long)n);
+        return -1;
+    }
+
+    for (ssize_t i = 0; i < n; i++) {
+        struct libusb_device_descriptor desc;
+        if (libusb_get_device_descriptor(list[i], &desc) != 0) continue;
+
+        const char *name = find_usb_name(
+            starter_devices,
+            sizeof(starter_devices) / sizeof(starter_devices[0]),
+            desc.idVendor,
+            desc.idProduct
+        );
+        if (!name) continue;
+
+        printf(
+            "start candidate usb=%03u:%03u id=%04x:%04x (%s)\n",
+            libusb_get_bus_number(list[i]),
+            libusb_get_device_address(list[i]),
+            desc.idVendor,
+            desc.idProduct,
+            name
+        );
+
+        libusb_device_handle *handle = NULL;
+        int r = libusb_open(list[i], &handle);
+        if (r != 0 || !handle) {
+            printf("open starter failed: %s (%d)\n", libusb_error_name(r), r);
+            continue;
+        }
+
+        if (start_aoa_on_handle(handle) == 0) {
+            started++;
+        }
+
+        libusb_close(handle);
+        usleep(250000);
+    }
+
+    libusb_free_device_list(list, 1);
+    printf("AOA start requests sent: %d\n", started);
+    return started > 0 ? 0 : -1;
+}
+
 static int start_aoa_if_needed(libusb_context *ctx) {
     libusb_device_handle *handle = open_from_list(
         ctx,
@@ -286,58 +515,15 @@ static int start_aoa_if_needed(libusb_context *ctx) {
         return -1;
     }
 
-    unsigned char protocol[2] = {0};
-    int r = libusb_control_transfer(
-        handle,
-        LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE,
-        AOA_GET_PROTOCOL,
-        0,
-        0,
-        protocol,
-        sizeof(protocol),
-        1000
-    );
-
-    if (r != 2) {
-        printf("AOA_GET_PROTOCOL failed: %s (%d)\n", libusb_error_name(r), r);
-        libusb_close(handle);
-        return -1;
-    }
-
-    int version = protocol[0] | (protocol[1] << 8);
-    printf("AOA protocol version: %d\n", version);
-
-    if (send_aoa_string(handle, AOA_STRING_MANUFACTURER, "RK3568") < 0 ||
-        send_aoa_string(handle, AOA_STRING_MODEL, "RK-AOA-DEMO") < 0 ||
-        send_aoa_string(handle, AOA_STRING_DESCRIPTION, "RK3568 AOA Demo") < 0 ||
-        send_aoa_string(handle, AOA_STRING_VERSION, "1.0") < 0 ||
-        send_aoa_string(handle, AOA_STRING_URI, "https://example.com") < 0 ||
-        send_aoa_string(handle, AOA_STRING_SERIAL, "rk3568-001") < 0) {
-        libusb_close(handle);
-        return -1;
-    }
-
-    printf("starting accessory mode...\n");
-
-    r = libusb_control_transfer(
-        handle,
-        LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE,
-        AOA_START_ACCESSORY,
-        0,
-        0,
-        NULL,
-        0,
-        1000
-    );
+    int r = start_aoa_on_handle(handle);
 
     libusb_close(handle);
 
-    if (r < 0) {
-        printf("AOA_START_ACCESSORY failed: %s (%d)\n", libusb_error_name(r), r);
+    if (r != 0) {
         return -1;
     }
 
-    printf("AOA_START_ACCESSORY sent, waiting for re-enumeration...\n");
+    printf("waiting for AOA re-enumeration...\n");
 
     if (!wait_for_aoa(ctx, 6000)) {
         printf("AOA device did not appear before timeout\n");
@@ -822,15 +1008,17 @@ static int open_and_claim_aoa(
     int *in_ep_out,
     int *out_ep_out
 ) {
-    libusb_device_handle *handle = open_from_list(
+    libusb_device_handle *handle = open_from_list_filtered(
         ctx,
         aoa_devices,
         sizeof(aoa_devices) / sizeof(aoa_devices[0]),
+        1,
         1
     );
 
     if (!handle) {
         printf("AOA device not found\n");
+        print_matching_devices(ctx, aoa_devices, sizeof(aoa_devices) / sizeof(aoa_devices[0]), "AOA");
         return -1;
     }
 
@@ -865,20 +1053,73 @@ static int open_and_claim_aoa(
 }
 
 static void print_usage(const char *argv0) {
-    printf("Usage: %s WINDOWS_IP [video_port] [control_port]\n", argv0);
-    printf("Example: %s 192.168.110.23 9001 9002\n", argv0);
+    printf("Usage: %s WINDOWS_IP [video_port] [control_port] [options]\n", argv0);
+    printf("       %s --list\n", argv0);
+    printf("       %s --start-all\n", argv0);
+    printf("Options:\n");
+    printf("  --device-index N   bind the Nth AOA device from --list\n");
+    printf("  --usb BUS:ADDR     bind an AOA device by lsusb bus/address, for example 005:032\n");
+    printf("Example:\n");
+    printf("  %s 192.168.110.23 9001 9002 --device-index 0\n", argv0);
+    printf("  %s 192.168.110.23 9011 9012 --usb 005:033\n", argv0);
+}
+
+static int parse_usb_selector(const char *text) {
+    int bus = -1;
+    int address = -1;
+
+    if (!text || sscanf(text, "%d:%d", &bus, &address) != 2) {
+        return -1;
+    }
+
+    if (bus < 0 || bus > 255 || address < 0 || address > 255) {
+        return -1;
+    }
+
+    selected_usb_bus = bus;
+    selected_usb_address = address;
+    return 0;
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        print_usage(argv[0]);
-        return 1;
+    int list_only = 0;
+    int start_all_only = 0;
+    int positional_count = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--list") == 0) {
+            list_only = 1;
+        } else if (strcmp(argv[i], "--start-all") == 0) {
+            start_all_only = 1;
+        } else if (strcmp(argv[i], "--device-index") == 0) {
+            if (i + 1 >= argc) {
+                print_usage(argv[0]);
+                return 1;
+            }
+            selected_device_index = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--usb") == 0) {
+            if (i + 1 >= argc || parse_usb_selector(argv[++i]) != 0) {
+                print_usage(argv[0]);
+                return 1;
+            }
+        } else if (argv[i][0] == '-') {
+            print_usage(argv[0]);
+            return 1;
+        } else if (positional_count == 0) {
+            windows_ip = argv[i];
+            positional_count++;
+        } else if (positional_count == 1) {
+            video_port = atoi(argv[i]);
+            positional_count++;
+        } else if (positional_count == 2) {
+            control_port = atoi(argv[i]);
+            positional_count++;
+        } else {
+            print_usage(argv[0]);
+            return 1;
+        }
     }
 
-    windows_ip = argv[1];
-
-    if (argc >= 3) video_port = atoi(argv[2]);
-    if (argc >= 4) control_port = atoi(argv[3]);
     if (video_port <= 0) video_port = DEFAULT_VIDEO_PORT;
     if (control_port <= 0) control_port = DEFAULT_CONTROL_PORT;
 
@@ -897,6 +1138,37 @@ int main(int argc, char **argv) {
     if (r != 0) {
         printf("libusb_init failed: %s (%d)\n", libusb_error_name(r), r);
         return 1;
+    }
+
+    if (list_only) {
+        print_matching_devices(ctx, aoa_devices, sizeof(aoa_devices) / sizeof(aoa_devices[0]), "AOA");
+        print_matching_devices(ctx, starter_devices, sizeof(starter_devices) / sizeof(starter_devices[0]), "Starter");
+        libusb_exit(ctx);
+        return 0;
+    }
+
+    if (start_all_only) {
+        int sr = start_all_starter_devices(ctx);
+        if (sr == 0) {
+            printf("wait 2 seconds, then run: %s --list\n", argv[0]);
+            usleep(2000000);
+        }
+        libusb_exit(ctx);
+        return sr == 0 ? 0 : 1;
+    }
+
+    if (!windows_ip) {
+        print_usage(argv[0]);
+        libusb_exit(ctx);
+        return 1;
+    }
+
+    if (selected_usb_bus >= 0) {
+        printf("device selector: usb=%03d:%03d\n", selected_usb_bus, selected_usb_address);
+    } else if (selected_device_index >= 0) {
+        printf("device selector: index=%d\n", selected_device_index);
+    } else {
+        printf("device selector: first available AOA device\n");
     }
 
     if (start_aoa_if_needed(ctx) != 0) {

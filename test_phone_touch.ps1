@@ -1,5 +1,6 @@
 param(
     [string]$RkHost = "192.168.110.86",
+    [int]$Instance = -1,
     [int]$ControlPort = 9002,
     [ValidateSet("tap", "down", "move", "up", "swipe", "doubletap")]
     [string]$Type = "tap",
@@ -14,6 +15,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($Instance -ge 0) {
+    $ControlPort = 9002 + ($Instance * 10)
+}
 
 function Send-ControlJson {
     param(

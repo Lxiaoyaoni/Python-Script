@@ -4,3 +4,7 @@
 
  启动rk3568中转
  ./rk_aoa_bridge 192.168.110.69 9001 9002
+
+
+ 多台启动
+ .\start_multi_windows.ps1 -RkHost 192.168.110.86 -Count 3
